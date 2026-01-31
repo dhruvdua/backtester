@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import io
 import re
@@ -95,7 +96,18 @@ def run_backtest(df, weights, sip_amount):
     max_dd = abs(res_df['Drawdown'].min()) * 100
     romad = xirr_val / max_dd if max_dd > 0 else 0
     
-    sharpe = (daily_port_ret.mean() * 252) / (daily_port_ret.std() * np.sqrt(252))
+    # Standard Deviation (Volatility)
+    port_vol = daily_port_ret.std() * np.sqrt(252)
+    sharpe = (daily_port_ret.mean() * 252) / port_vol if port_vol > 0 else 0
+    
+    # Diversification Ratio Calculation
+    # 1. Get volatility of each individual fund
+    individual_vols = daily_ret.std() * np.sqrt(252)
+    # 2. Weighted average volatility (The "Sum of Parts")
+    weighted_vol = np.sum(w_array * individual_vols)
+    # 3. Ratio: Weighted Vol / Actual Portfolio Vol
+    div_ratio = weighted_vol / port_vol if port_vol > 0 else 0
+    
     avg_rolling_3y = calculate_rolling_returns(daily_cum_path, years=3) * 100
 
     metrics = {
@@ -105,7 +117,8 @@ def run_backtest(df, weights, sip_amount):
         "RoMaD": romad,
         "MaxDD": max_dd,
         "Sharpe": sharpe,
-        "Rolling3Y": avg_rolling_3y
+        "Rolling3Y": avg_rolling_3y,
+        "DivRatio": div_ratio
     }
     return metrics, res_df
 
@@ -147,29 +160,25 @@ def load_data_google(sheet_url):
 # --- AMFI API HELPERS ---
 @st.cache_data
 def get_all_amfi_schemes():
-    """Fetches list of all mutual funds"""
     url = "https://api.mfapi.in/mf"
     try:
         response = requests.get(url)
-        data = response.json()
-        return pd.DataFrame(data)
+        return pd.DataFrame(response.json())
     except:
         return pd.DataFrame()
 
 @st.cache_data
 def fetch_amfi_nav(scheme_code):
-    """Fetches historical NAV"""
     url = f"https://api.mfapi.in/mf/{scheme_code}"
     try:
         response = requests.get(url)
         data = response.json()
         if data['status'] == 'SUCCESS':
-            nav_data = data['data']
-            df = pd.DataFrame(nav_data)
+            df = pd.DataFrame(data['data'])
             df['date'] = pd.to_datetime(df['date'], format='%d-%m-%Y')
             df['nav'] = pd.to_numeric(df['nav'])
             df.set_index('date', inplace=True)
-            df.sort_index(ascending=True, inplace=True) # Important: Sort dates ascending
+            df.sort_index(ascending=True, inplace=True)
             df.rename(columns={'nav': data['meta']['scheme_name']}, inplace=True)
             return df
         return pd.DataFrame()
@@ -180,7 +189,6 @@ def fetch_amfi_nav(scheme_code):
 st.sidebar.header("⚙️ Configuration")
 data_source = st.sidebar.radio("Data Source:", ("Google Sheet", "AMFI API (Live)"))
 
-# Initialize session state for AMFI data to persist across re-runs
 if 'amfi_data' not in st.session_state:
     st.session_state['amfi_data'] = pd.DataFrame()
 
@@ -214,7 +222,6 @@ elif data_source == "AMFI API (Live)":
                 progress_text.empty()
                 
                 if dfs:
-                    # Merge all using outer join to preserve all dates
                     merged_df = pd.concat(dfs, axis=1)
                     merged_df.sort_index(inplace=True)
                     st.session_state['amfi_data'] = merged_df
@@ -224,7 +231,6 @@ elif data_source == "AMFI API (Live)":
             else:
                 st.warning("Please select at least one fund.")
     
-    # Use the persisted data
     if not st.session_state['amfi_data'].empty:
         df_global = st.session_state['amfi_data']
 
@@ -239,18 +245,15 @@ with st.sidebar.expander("🔎 Advanced Filters", expanded=False):
     filter_return = st.slider("Annual Return %", 0.0, 100.0, (0.0, 100.0), step=1.0)
     filter_rolling = st.slider("Avg 3Y Rolling %", 0.0, 100.0, (0.0, 100.0), step=1.0)
     filter_sharpe = st.slider("Sharpe Ratio", 0.0, 5.0, (0.0, 5.0), step=0.1)
+    filter_div = st.slider("Diversification Score", 1.0, 3.0, (1.0, 3.0), step=0.1, help="Higher = More Diversified")
 
 # --- MAIN APP LOGIC ---
 if not df_global.empty:
     all_funds = df_global.columns.tolist()
-    
-    # If AMFI, funds are already user-selected. If Google Sheet, let user pick columns.
     if data_source == "Google Sheet":
         st.subheader("1. Select Funds")
         selected_funds = st.multiselect("Select Funds (Min 2)", all_funds, default=all_funds[:2])
     else:
-        # For AMFI, we assume all fetched funds are the ones to analyze
-        # But we allow deselecting here just in case
         st.subheader("1. Selected Funds")
         selected_funds = st.multiselect("Funds to Analyze", all_funds, default=all_funds)
 
@@ -258,8 +261,6 @@ if not df_global.empty:
     
     if len(selected_funds) > 1:
         df_selected = df_global[selected_funds]
-        
-        # Determine common available window
         valid_data = df_selected.dropna()
         
         if valid_data.empty:
@@ -270,8 +271,6 @@ if not df_global.empty:
             
             with c2:
                 st.write("### 📅 Select Time Period")
-                st.caption(f"Available Range: {min_date} to {max_date}")
-                
                 col_start, col_end = st.columns(2)
                 start_date = col_start.date_input("Start Date", min_date, min_value=min_date, max_value=max_date)
                 end_date = col_end.date_input("End Date", max_date, min_value=min_date, max_value=max_date)
@@ -280,149 +279,196 @@ if not df_global.empty:
                     st.error("Start Date must be before End Date.")
                     df_filtered = pd.DataFrame()
                 else:
-                    # Convert date inputs to datetime for pandas slicing
                     df_filtered = valid_data.loc[str(start_date):str(end_date)]
                     st.success(f"Analyzing {len(df_filtered)} trading days.")
 
             if not df_filtered.empty:
-                # --- MANUAL ALLOCATION ---
-                st.markdown("---")
-                st.subheader("2. Define Your Strategy")
-                col_manual, col_chart = st.columns([1, 2])
-                manual_weights = {}
-                with col_manual:
-                    st.write("#### 🎛️ Manual Allocation")
-                    total_w = 0
-                    for fund in selected_funds:
-                        default_w = int(100/len(selected_funds))
-                        w = st.number_input(f"{fund} (%)", min_value=0, max_value=100, value=default_w, step=5)
-                        manual_weights[fund] = w
-                        total_w += w
-                    if total_w != 100: st.warning(f"Total: {total_w}%")
+                tab1, tab2 = st.tabs(["🚀 Strategy Lab", "🧩 Correlation Matrix"])
 
-                m_metrics, m_df = run_backtest(df_filtered, manual_weights, sip_amount)
+                # ==========================
+                # TAB 1: STRATEGY LAB
+                # ==========================
+                with tab1:
+                    st.markdown("---")
+                    st.subheader("2. Define Your Strategy")
+                    col_manual, col_chart = st.columns([1, 2])
+                    manual_weights = {}
+                    with col_manual:
+                        st.write("#### 🎛️ Manual Allocation")
+                        total_w = 0
+                        for fund in selected_funds:
+                            default_w = int(100/len(selected_funds))
+                            w = st.number_input(f"{fund} (%)", min_value=0, max_value=100, value=default_w, step=5)
+                            manual_weights[fund] = w
+                            total_w += w
+                        if total_w != 100: st.warning(f"Total: {total_w}%")
 
-                with col_chart:
-                    st.write("#### 📊 Your Performance")
-                    if m_metrics:
-                        mc1, mc2, mc3, mc4 = st.columns(4)
-                        mc1.metric("XIRR", f"{m_metrics['XIRR']:.2f}%")
-                        mc2.metric("3Y Rolling", f"{m_metrics['Rolling3Y']:.2f}%")
-                        mc3.metric("RoMaD", f"{m_metrics['RoMaD']:.2f}")
-                        mc4.metric("Sharpe", f"{m_metrics['Sharpe']:.2f}")
-                        fig = px.line(m_df, x='Date', y=['Invested', 'Value'], 
-                                        color_discrete_map={'Invested':'#D3D3D3', 'Value':'#3b82f6'})
-                        fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
-                        st.plotly_chart(fig, use_container_width=True)
+                    m_metrics, m_df = run_backtest(df_filtered, manual_weights, sip_amount)
 
-                # --- AI OPTIMIZATION ---
-                st.markdown("---")
-                st.subheader("3. AI Optimization Engine")
-                
-                opt_col1, opt_col2 = st.columns([1, 3])
-                with opt_col1:
-                    optimize_for = st.selectbox(
-                        "Maximize For:",
-                        ("Rolling Returns (Consistency)", "RoMaD (Max Safety)", "Sharpe (Max Efficiency)", "Returns (Max Profit)")
-                    )
-                    st.write("##### 🛠️ Best X Funds Strategy")
-                    use_best_x = st.checkbox("Pick Subset?", value=False)
-                    if use_best_x:
-                        x_funds = st.slider("Number of funds (X)", 2, len(selected_funds), 2)
-                    else:
-                        x_funds = len(selected_funds)
-                    run_opt = st.button("🚀 Run AI Optimizer")
+                    with col_chart:
+                        st.write("#### 📊 Your Performance")
+                        if m_metrics:
+                            mc1, mc2, mc3, mc4 = st.columns(4)
+                            mc1.metric("XIRR", f"{m_metrics['XIRR']:.2f}%")
+                            mc2.metric("3Y Rolling", f"{m_metrics['Rolling3Y']:.2f}%")
+                            mc3.metric("RoMaD", f"{m_metrics['RoMaD']:.2f}")
+                            mc4.metric("Div. Score", f"{m_metrics['DivRatio']:.2f}", help="Diversification Ratio (Higher is better)")
+                            fig = px.line(m_df, x='Date', y=['Invested', 'Value'], 
+                                            color_discrete_map={'Invested':'#D3D3D3', 'Value':'#3b82f6'})
+                            fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
 
-                if run_opt:
-                    with st.spinner(f"Simulating {num_simulations} portfolios..."):
-                        daily_returns = df_filtered.pct_change().dropna()
-                        mean_returns = daily_returns.mean() * 252 
-                        cov_matrix = daily_returns.cov() * 252
-                        sim_data = []
-                        roll_window = 756
-                        
-                        for i in range(num_simulations):
-                            w = np.random.random(len(selected_funds))
-                            if use_best_x:
-                                top_indices = np.argpartition(w, -x_funds)[-x_funds:]
-                                mask = np.zeros_like(w)
-                                mask[top_indices] = w[top_indices]
-                                w = mask
-                            w /= np.sum(w)
-                            
-                            ret = np.sum(mean_returns * w)
-                            vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
-                            sharpe = ret / vol if vol > 0 else 0
-                            path_daily = daily_returns.dot(w)
-                            cum_path = (1 + path_daily).cumprod()
-                            dd = (cum_path - cum_path.cummax()) / cum_path.cummax()
-                            max_dd = abs(dd.min())
-                            romad = ret / max_dd if max_dd > 0 else 0
-                            avg_roll = 0
-                            if len(cum_path) > roll_window:
-                                roll_ret_series = (cum_path.values[roll_window:] / cum_path.values[:-roll_window]) ** (1/3) - 1
-                                avg_roll = np.mean(roll_ret_series)
-                            
-                            sim_data.append({
-                                "weights": w,
-                                "Returns": ret * 100,
-                                "RoMaD": romad,
-                                "Rolling": avg_roll * 100,
-                                "Sharpe": sharpe
-                            })
-                        
-                        sim_df = pd.DataFrame(sim_data)
-                        mask = (
-                            (sim_df["RoMaD"].between(filter_romad[0], filter_romad[1])) &
-                            (sim_df["Returns"].between(filter_return[0], filter_return[1])) &
-                            (sim_df["Rolling"].between(filter_rolling[0], filter_rolling[1])) &
-                            (sim_df["Sharpe"].between(filter_sharpe[0], filter_sharpe[1]))
+                    # --- AI OPTIMIZATION ---
+                    st.markdown("---")
+                    st.subheader("3. AI Optimization Engine")
+                    
+                    opt_col1, opt_col2 = st.columns([1, 3])
+                    with opt_col1:
+                        optimize_for = st.selectbox(
+                            "Maximize For:",
+                            ("Diversification (Min Correlation)", "Rolling Returns (Consistency)", "RoMaD (Max Safety)", "Sharpe (Max Efficiency)", "Returns (Max Profit)")
                         )
-                        filtered_df = sim_df[mask]
-                        
-                        if filtered_df.empty:
-                            st.warning("⚠️ No match found. Showing best Unfiltered result.")
-                            final_df = sim_df
+                        st.write("##### 🛠️ Best X Funds Strategy")
+                        use_best_x = st.checkbox("Pick Subset?", value=False)
+                        if use_best_x:
+                            x_funds = st.slider("Number of funds (X)", 2, len(selected_funds), 2)
                         else:
-                            st.success(f"✅ Found {len(filtered_df)} matching portfolios.")
-                            final_df = filtered_df
-                        
-                        if "RoMaD" in optimize_for: best_row = final_df.loc[final_df['RoMaD'].idxmax()]
-                        elif "Sharpe" in optimize_for: best_row = final_df.loc[final_df['Sharpe'].idxmax()]
-                        elif "Rolling" in optimize_for: best_row = final_df.loc[final_df['Rolling'].idxmax()]
-                        else: best_row = final_df.loc[final_df['Returns'].idxmax()]
-                        
-                        best_weights = {f: w*100 for f, w in zip(selected_funds, best_row['weights'])}
-                        ai_metrics, ai_df = run_backtest(df_filtered, best_weights, sip_amount)
-                        
-                        comp_col1, comp_col2 = st.columns(2)
-                        with comp_col1:
-                            st.write("**Manual**")
-                            man_df = pd.DataFrame.from_dict(manual_weights, orient='index', columns=['Weight'])
-                            st.dataframe(man_df.style.format("{:.1f}%"))
-                        with comp_col2:
-                            st.write("**AI Optimized**")
-                            ai_alloc_df = pd.DataFrame.from_dict(best_weights, orient='index', columns=['Weight'])
-                            st.dataframe(ai_alloc_df.style.format("{:.1f}%"))
-                        
-                        comp_metrics = pd.DataFrame({
-                            "Metric": ["XIRR", "Avg 3Y Rolling", "RoMaD", "Max DD", "Sharpe", "Final Value"],
-                            "Your Strategy": [
-                                f"{m_metrics['XIRR']:.2f}%", f"{m_metrics['Rolling3Y']:.2f}%", f"{m_metrics['RoMaD']:.2f}", 
-                                f"{m_metrics['MaxDD']:.2f}%", f"{m_metrics['Sharpe']:.2f}", f"₹{m_metrics['Current Value']:,.0f}"
-                            ],
-                            "AI Strategy": [
-                                f"{ai_metrics['XIRR']:.2f}%", f"{ai_metrics['Rolling3Y']:.2f}%", f"{ai_metrics['RoMaD']:.2f}", 
-                                f"{ai_metrics['MaxDD']:.2f}%", f"{ai_metrics['Sharpe']:.2f}", f"₹{ai_metrics['Current Value']:,.0f}"
-                            ]
-                        })
-                        st.table(comp_metrics)
-                        merged_chart = m_df[['Date', 'Value']].rename(columns={'Value': 'Your Strategy'})
-                        merged_chart['AI Strategy'] = ai_df['Value']
-                        merged_chart['Invested'] = m_df['Invested']
-                        fig_comp = px.line(merged_chart, x='Date', y=['Invested', 'Your Strategy', 'AI Strategy'],
-                                            color_discrete_map={'Invested':'#D3D3D3', 'Your Strategy':'#3b82f6', 'AI Strategy':'#22c55e'})
-                        st.plotly_chart(fig_comp, use_container_width=True)
+                            x_funds = len(selected_funds)
+                        run_opt = st.button("🚀 Run AI Optimizer")
+
+                    if run_opt:
+                        with st.spinner(f"Simulating {num_simulations} portfolios..."):
+                            daily_returns = df_filtered.pct_change().dropna()
+                            mean_returns = daily_returns.mean() * 252 
+                            cov_matrix = daily_returns.cov() * 252
+                            # Individual Volatility for Diversification Ratio
+                            individual_vols = daily_returns.std() * np.sqrt(252)
+                            
+                            sim_data = []
+                            roll_window = 756
+                            
+                            for i in range(num_simulations):
+                                w = np.random.random(len(selected_funds))
+                                if use_best_x:
+                                    top_indices = np.argpartition(w, -x_funds)[-x_funds:]
+                                    mask = np.zeros_like(w)
+                                    mask[top_indices] = w[top_indices]
+                                    w = mask
+                                w /= np.sum(w)
+                                
+                                ret = np.sum(mean_returns * w)
+                                port_vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
+                                sharpe = ret / port_vol if port_vol > 0 else 0
+                                
+                                # Diversification Ratio
+                                weighted_vol = np.sum(w * individual_vols)
+                                div_ratio = weighted_vol / port_vol if port_vol > 0 else 0
+                                
+                                path_daily = daily_returns.dot(w)
+                                cum_path = (1 + path_daily).cumprod()
+                                dd = (cum_path - cum_path.cummax()) / cum_path.cummax()
+                                max_dd = abs(dd.min())
+                                romad = ret / max_dd if max_dd > 0 else 0
+                                avg_roll = 0
+                                if len(cum_path) > roll_window:
+                                    roll_ret_series = (cum_path.values[roll_window:] / cum_path.values[:-roll_window]) ** (1/3) - 1
+                                    avg_roll = np.mean(roll_ret_series)
+                                
+                                sim_data.append({
+                                    "weights": w,
+                                    "Returns": ret * 100,
+                                    "RoMaD": romad,
+                                    "Rolling": avg_roll * 100,
+                                    "Sharpe": sharpe,
+                                    "DivRatio": div_ratio
+                                })
+                            
+                            sim_df = pd.DataFrame(sim_data)
+                            mask = (
+                                (sim_df["RoMaD"].between(filter_romad[0], filter_romad[1])) &
+                                (sim_df["Returns"].between(filter_return[0], filter_return[1])) &
+                                (sim_df["Rolling"].between(filter_rolling[0], filter_rolling[1])) &
+                                (sim_df["Sharpe"].between(filter_sharpe[0], filter_sharpe[1])) &
+                                (sim_df["DivRatio"].between(filter_div[0], filter_div[1]))
+                            )
+                            filtered_df = sim_df[mask]
+                            
+                            if filtered_df.empty:
+                                st.warning("⚠️ No match found. Showing best Unfiltered result.")
+                                final_df = sim_df
+                            else:
+                                st.success(f"✅ Found {len(filtered_df)} matching portfolios.")
+                                final_df = filtered_df
+                            
+                            if "RoMaD" in optimize_for: best_row = final_df.loc[final_df['RoMaD'].idxmax()]
+                            elif "Sharpe" in optimize_for: best_row = final_df.loc[final_df['Sharpe'].idxmax()]
+                            elif "Rolling" in optimize_for: best_row = final_df.loc[final_df['Rolling'].idxmax()]
+                            elif "Diversification" in optimize_for: best_row = final_df.loc[final_df['DivRatio'].idxmax()]
+                            else: best_row = final_df.loc[final_df['Returns'].idxmax()]
+                            
+                            best_weights = {f: w*100 for f, w in zip(selected_funds, best_row['weights'])}
+                            ai_metrics, ai_df = run_backtest(df_filtered, best_weights, sip_amount)
+                            
+                            comp_col1, comp_col2 = st.columns(2)
+                            with comp_col1:
+                                st.write("**Manual**")
+                                man_df = pd.DataFrame.from_dict(manual_weights, orient='index', columns=['Weight'])
+                                st.dataframe(man_df.style.format("{:.1f}%"))
+                            with comp_col2:
+                                st.write(f"**AI Strategy ({optimize_for})**")
+                                ai_alloc_df = pd.DataFrame.from_dict(best_weights, orient='index', columns=['Weight'])
+                                st.dataframe(ai_alloc_df.style.format("{:.1f}%"))
+                            
+                            comp_metrics = pd.DataFrame({
+                                "Metric": ["XIRR", "Div Score", "RoMaD", "Max DD", "Sharpe", "Final Value"],
+                                "Your Strategy": [
+                                    f"{m_metrics['XIRR']:.2f}%", f"{m_metrics['DivRatio']:.2f}", f"{m_metrics['RoMaD']:.2f}", 
+                                    f"{m_metrics['MaxDD']:.2f}%", f"{m_metrics['Sharpe']:.2f}", f"₹{m_metrics['Current Value']:,.0f}"
+                                ],
+                                "AI Strategy": [
+                                    f"{ai_metrics['XIRR']:.2f}%", f"{ai_metrics['DivRatio']:.2f}", f"{ai_metrics['RoMaD']:.2f}", 
+                                    f"{ai_metrics['MaxDD']:.2f}%", f"{ai_metrics['Sharpe']:.2f}", f"₹{ai_metrics['Current Value']:,.0f}"
+                                ]
+                            })
+                            st.table(comp_metrics)
+                            merged_chart = m_df[['Date', 'Value']].rename(columns={'Value': 'Your Strategy'})
+                            merged_chart['AI Strategy'] = ai_df['Value']
+                            merged_chart['Invested'] = m_df['Invested']
+                            fig_comp = px.line(merged_chart, x='Date', y=['Invested', 'Your Strategy', 'AI Strategy'],
+                                                color_discrete_map={'Invested':'#D3D3D3', 'Your Strategy':'#3b82f6', 'AI Strategy':'#22c55e'})
+                            st.plotly_chart(fig_comp, use_container_width=True)
+
+                # ==========================
+                # TAB 2: CORRELATION MATRIX
+                # ==========================
+                with tab2:
+                    st.subheader("🧩 Fund Correlation Matrix")
+                    st.caption("Lower numbers (Blue) = Better Diversification. Red = Duplication.")
+                    
+                    daily_ret = df_filtered.pct_change().dropna()
+                    corr_matrix = daily_ret.corr()
+                    
+                    fig_corr = px.imshow(
+                        corr_matrix, 
+                        text_auto=True, 
+                        aspect="auto",
+                        color_continuous_scale="RdBu_r", # Red = High Corr, Blue = Low Corr
+                        zmin=-1, zmax=1
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+                    
+                    st.subheader("🔄 Rolling Correlation (Dynamic)")
+                    f1 = st.selectbox("Fund A", selected_funds, index=0)
+                    f2 = st.selectbox("Fund B", selected_funds, index=1 if len(selected_funds)>1 else 0)
+                    
+                    if f1 != f2:
+                        roll_corr = daily_ret[f1].rolling(126).corr(daily_ret[f2]) # 6-month rolling
+                        fig_roll = px.line(roll_corr, title=f"6-Month Rolling Correlation: {f1} vs {f2}")
+                        fig_roll.add_hline(y=0, line_dash="dash", line_color="green", annotation_text="Uncorrelated")
+                        fig_roll.update_yaxes(range=[-1, 1])
+                        st.plotly_chart(fig_roll, use_container_width=True)
+                    else:
+                        st.info("Select two different funds to see their dynamic relationship.")
     else:
         st.info("👈 Select at least 2 funds.")
 else:
