@@ -52,23 +52,14 @@ def calculate_xirr(dates, amounts):
         return 0.0
 
 def calculate_rolling_returns(series, years=3):
-    """
-    Calculates the average annualized rolling return over a specified period.
-    Assumes 'series' is daily cumulative portfolio value.
-    """
+    """Calculates the average annualized rolling return."""
     trading_days = int(years * 252)
-    if len(series) < trading_days:
-        return 0.0
-    
-    # Calculate returns for every window of 'trading_days'
-    # Formula: (Price_End / Price_Start)^(1/years) - 1
+    if len(series) < trading_days: return 0.0
     rolling_ret = (series / series.shift(trading_days)) ** (1/years) - 1
     return rolling_ret.mean()
 
 def run_backtest(df, weights, sip_amount):
-    """
-    Core engine to calculate metrics for ANY set of weights
-    """
+    """Core engine to calculate metrics for ANY set of weights"""
     # 1. SIP Simulation (Monthly)
     monthly_data = df.resample('MS').first()
     total_invested = 0
@@ -93,32 +84,26 @@ def run_backtest(df, weights, sip_amount):
     res_df = pd.DataFrame(ledger)
     if res_df.empty: return None, None
     
-    # 2. Daily Portfolio Path (For Rolling Returns & Sharpe)
-    # We need daily path to calculate rolling returns accurately
+    # 2. Daily Portfolio Path
     daily_ret = df.pct_change().dropna()
     w_array = np.array([weights[col] for col in df.columns]) / 100.0
     daily_port_ret = daily_ret.dot(w_array)
     daily_cum_path = (1 + daily_port_ret).cumprod()
     
-    # Metrics Calculation
+    # Metrics
     final_val = res_df.iloc[-1]['Value']
     invested = res_df.iloc[-1]['Invested']
     
-    # XIRR
     cash_flows_date.append(res_df.iloc[-1]['Date'])
     cash_flows_amount.append(final_val)
     xirr_val = calculate_xirr(cash_flows_date, cash_flows_amount) * 100
     
-    # Drawdown & RoMaD
     res_df['Peak'] = res_df['Value'].cummax()
     res_df['Drawdown'] = (res_df['Value'] - res_df['Peak']) / res_df['Peak']
     max_dd = abs(res_df['Drawdown'].min()) * 100
     romad = xirr_val / max_dd if max_dd > 0 else 0
     
-    # Sharpe
     sharpe = (daily_port_ret.mean() * 252) / (daily_port_ret.std() * np.sqrt(252))
-    
-    # 3-Year Average Rolling Return
     avg_rolling_3y = calculate_rolling_returns(daily_cum_path, years=3) * 100
 
     metrics = {
@@ -183,13 +168,17 @@ sip_amount = st.sidebar.number_input("Monthly SIP Amount (₹)", value=10000, st
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔬 Simulation Settings")
-num_simulations = st.sidebar.number_input(
-    "Number of Simulations", 
-    min_value=500, 
-    max_value=50000, 
-    value=3000, 
-    step=500
-)
+num_simulations = st.sidebar.number_input("Simulations", 500, 50000, 3000, step=500)
+
+# --- FILTER INPUTS ---
+with st.sidebar.expander("🔎 Advanced Filters", expanded=False):
+    st.caption("Restrict AI to portfolios that fit these criteria:")
+    
+    # Ranges
+    filter_romad = st.slider("RoMaD Range", 0.0, 5.0, (0.0, 5.0), step=0.1)
+    filter_return = st.slider("Annual Return % (XIRR Proxy)", 0.0, 100.0, (0.0, 100.0), step=1.0)
+    filter_rolling = st.slider("Avg 3Y Rolling %", 0.0, 100.0, (0.0, 100.0), step=1.0)
+    filter_sharpe = st.slider("Sharpe Ratio", 0.0, 5.0, (0.0, 5.0), step=0.1)
 
 # --- MAIN APP ---
 if sheet_url:
@@ -247,7 +236,7 @@ if sheet_url:
                             if m_metrics:
                                 mc1, mc2, mc3, mc4 = st.columns(4)
                                 mc1.metric("XIRR", f"{m_metrics['XIRR']:.2f}%", help="Annualized SIP Return")
-                                mc2.metric("3Y Rolling", f"{m_metrics['Rolling3Y']:.2f}%", help="Avg 3-Year Rolling Return (Consistency)")
+                                mc2.metric("3Y Rolling", f"{m_metrics['Rolling3Y']:.2f}%", help="Consistency")
                                 mc3.metric("RoMaD", f"{m_metrics['RoMaD']:.2f}", help=f"Max DD: {m_metrics['MaxDD']:.1f}%")
                                 mc4.metric("Sharpe", f"{m_metrics['Sharpe']:.2f}")
                                 
@@ -261,7 +250,6 @@ if sheet_url:
                         st.subheader("3. AI Optimization Engine")
                         
                         opt_col1, opt_col2 = st.columns([1, 3])
-                        
                         with opt_col1:
                             optimize_for = st.selectbox(
                                 "Maximize For:",
@@ -275,53 +263,74 @@ if sheet_url:
                                 mean_returns = daily_returns.mean() * 252 
                                 cov_matrix = daily_returns.cov() * 252
                                 
-                                best_score = -np.inf
-                                best_w_array = []
-                                
-                                # Rolling Return window (3 years = ~756 days)
+                                # Store all simulations
+                                sim_data = []
                                 roll_window = 756
                                 
                                 for i in range(num_simulations):
                                     w = np.random.random(len(selected_funds))
                                     w /= np.sum(w)
                                     
-                                    # Basic Metrics
-                                    ret = np.sum(mean_returns * w)
+                                    # Metrics
+                                    ret = np.sum(mean_returns * w) # Theoretical Return
                                     vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
                                     sharpe = ret / vol if vol > 0 else 0
                                     
-                                    # Path Calculation (Vectorized)
+                                    # Path & RoMaD
                                     path_daily = daily_returns.dot(w)
                                     cum_path = (1 + path_daily).cumprod()
-                                    
-                                    # RoMaD
                                     dd = (cum_path - cum_path.cummax()) / cum_path.cummax()
                                     max_dd = abs(dd.min())
                                     romad = ret / max_dd if max_dd > 0 else 0
                                     
-                                    # Rolling Returns
-                                    # Use NumPy slicing for speed: values[756:] / values[:-756]
+                                    # Rolling
+                                    avg_roll = 0
                                     if len(cum_path) > roll_window:
-                                        # Calculate 3Y returns across the whole history
                                         roll_ret_series = (cum_path.values[roll_window:] / cum_path.values[:-roll_window]) ** (1/3) - 1
                                         avg_roll = np.mean(roll_ret_series)
-                                    else:
-                                        avg_roll = 0
                                     
-                                    # Score based on Goal
-                                    if "RoMaD" in optimize_for: score = romad
-                                    elif "Sharpe" in optimize_for: score = sharpe
-                                    elif "Rolling" in optimize_for: score = avg_roll
-                                    else: score = ret
-                                    
-                                    if score > best_score:
-                                        best_score = score
-                                        best_w_array = w
+                                    sim_data.append({
+                                        "weights": w,
+                                        "Returns": ret * 100, # convert to %
+                                        "RoMaD": romad,
+                                        "Rolling": avg_roll * 100,
+                                        "Sharpe": sharpe
+                                    })
                                 
-                                best_weights = {f: w*100 for f, w in zip(selected_funds, best_w_array)}
+                                # Convert to DataFrame for Filtering
+                                sim_df = pd.DataFrame(sim_data)
+                                
+                                # --- APPLY FILTERS ---
+                                mask = (
+                                    (sim_df["RoMaD"].between(filter_romad[0], filter_romad[1])) &
+                                    (sim_df["Returns"].between(filter_return[0], filter_return[1])) &
+                                    (sim_df["Rolling"].between(filter_rolling[0], filter_rolling[1])) &
+                                    (sim_df["Sharpe"].between(filter_sharpe[0], filter_sharpe[1]))
+                                )
+                                
+                                filtered_df = sim_df[mask]
+                                
+                                if filtered_df.empty:
+                                    st.warning("⚠️ No portfolios matched your strict filters. Showing best Unfiltered result instead.")
+                                    final_df = sim_df
+                                else:
+                                    st.success(f"✅ Found {len(filtered_df)} portfolios matching your criteria.")
+                                    final_df = filtered_df
+                                
+                                # --- SELECT BEST ---
+                                if "RoMaD" in optimize_for:
+                                    best_row = final_df.loc[final_df['RoMaD'].idxmax()]
+                                elif "Sharpe" in optimize_for:
+                                    best_row = final_df.loc[final_df['Sharpe'].idxmax()]
+                                elif "Rolling" in optimize_for:
+                                    best_row = final_df.loc[final_df['Rolling'].idxmax()]
+                                else:
+                                    best_row = final_df.loc[final_df['Returns'].idxmax()]
+                                
+                                best_weights = {f: w*100 for f, w in zip(selected_funds, best_row['weights'])}
+                                
+                                # Run Backtest
                                 ai_metrics, ai_df = run_backtest(df_filtered, best_weights, sip_amount)
-                                
-                                st.success(f"✅ Optimization Complete! Best {optimize_for} Strategy found.")
                                 
                                 comp_col1, comp_col2 = st.columns(2)
                                 with comp_col1:
