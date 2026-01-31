@@ -34,19 +34,43 @@ def get_csv_url(url):
     return final_url
 
 # --- 1. Data Loading ---
+# --- 1. Data Loading (Robust Version) ---
 @st.cache_data
 def load_data(sheet_url):
     try:
         csv_url = get_csv_url(sheet_url)
-        df = pd.read_csv(csv_url)
         
-        # specific cleanup for your date column
-        # Ensure your date column is named 'Date' in the sheet
-        df['Date'] = pd.to_datetime(df['Date'])
+        # 1. Read the CSV
+        # on_bad_lines='skip' helps if some rows have too many/few commas
+        df = pd.read_csv(csv_url, on_bad_lines='skip')
+        
+        # 2. Check if we actually got data or a Google Login page
+        if df.columns[0] == '<!DOCTYPE html>':
+            st.error("Error: The code downloaded a Login Page instead of data. Please set your Google Sheet access to 'Anyone with the link'.")
+            return pd.DataFrame()
+
+        # 3. Clean column names (remove spaces)
+        df.columns = df.columns.str.strip()
+        
+        # 4. Flexible Date Parsing
+        # errors='coerce' turns non-dates (like "Total" or empty rows) into NaT (Not a Time)
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        
+        # 5. Drop rows where Date is invalid (NaT)
+        df = df.dropna(subset=['Date'])
+        
+        # 6. Set Index
         df.set_index('Date', inplace=True)
-        return df
+        
+        # 7. Ensure all other columns are numeric
+        # This converts string numbers like "1,000" to 1000 and "Text" to NaN
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        return df.dropna() # Final cleanup of any rows with bad number data
+
     except Exception as e:
-        st.error(f"Error loading data: {e}. Check if the sheet is 'Published to Web' or 'Anyone with link can view'.")
+        st.error(f"Error loading data: {e}")
         return pd.DataFrame()
 
 # --- 2. Sidebar Inputs ---
