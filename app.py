@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 import requests
 import io
+from scipy import optimize # Required for XIRR calculation
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="SIP Backtest Pro", layout="wide")
@@ -24,13 +25,37 @@ def get_csv_url(url):
             gid = gid_match.group(1)
     return f"{base_url}/export?format=csv&gid={gid}"
 
+def calculate_xirr(dates, amounts):
+    """
+    Calculates XIRR (Extended Internal Rate of Return).
+    dates: list of datetime objects
+    amounts: list of cash flows (negative for investments, positive for current value)
+    """
+    if len(dates) != len(amounts):
+        return 0.0
+    
+    # Calculate days from first transaction
+    min_date = min(dates)
+    days = [(d - min_date).days for d in dates]
+    
+    # Define XNPV function (Net Present Value at various rates)
+    def xnpv(rate):
+        # Prevent division by zero or negative rates issues
+        if rate <= -1:
+            return float('inf')
+        return sum([a / ((1 + rate) ** (d / 365.0)) for a, d in zip(amounts, days)])
+
+    try:
+        # Newton-Raphson method to find the rate where NPV = 0
+        return optimize.newton(xnpv, 0.1)
+    except (RuntimeError, OverflowError):
+        return 0.0
+
 @st.cache_data
 def load_data(sheet_url):
-    """Robust data loader that handles commas, quotes, and empty cells"""
+    """Robust data loader"""
     try:
         csv_url = get_csv_url(sheet_url)
-        
-        # Fetch Data
         response = requests.get(csv_url)
         response.raise_for_status()
         
@@ -38,11 +63,9 @@ def load_data(sheet_url):
             st.error("⚠️ Error: The Google Sheet is not public. Please change permissions to 'Anyone with the link'.")
             return pd.DataFrame()
 
-        # Parse CSV
         df = pd.read_csv(io.StringIO(response.text), on_bad_lines='skip')
         df.columns = df.columns.str.strip()
         
-        # Handle Date Column
         date_col = next((col for col in df.columns if col.lower() == 'date'), None)
         if not date_col:
             st.error("⚠️ Error: Could not find a 'Date' column.")
@@ -50,21 +73,14 @@ def load_data(sheet_url):
             
         df.rename(columns={date_col: 'Date'}, inplace=True)
         df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
-        
-        # Drop rows ONLY if the Date itself is missing
         df = df.dropna(subset=['Date'])
         df.set_index('Date', inplace=True)
         
-        # --- ROBUST NUMBER CLEANING ---
-        # 1. Convert all columns to string first
-        # 2. Remove commas, quotes, and spaces
-        # 3. Convert back to numeric
+        # Clean Numbers
         for col in df.columns:
             df[col] = df[col].astype(str).str.replace(',', '').str.replace('"', '').str.strip()
             df[col] = pd.to_numeric(df[col], errors='coerce')
             
-        # CRITICAL CHANGE: Do NOT dropna() here. 
-        # We wait until the user selects funds.
         return df
         
     except Exception as e:
@@ -83,26 +99,18 @@ if sheet_url:
     df = load_data(sheet_url)
     
     if not df.empty:
-        # Fund Selection
         all_funds = df.columns.tolist()
         st.sidebar.markdown("---")
         selected_funds = st.sidebar.multiselect("Select Funds to Analyze", all_funds, default=all_funds[:2])
         
         if selected_funds:
-            # --- SMART FILTERING ---
-            # 1. Filter by Time
             end_date = df.index.max()
             start_date = end_date - pd.DateOffset(years=years)
-            
-            # 2. Slice Data (Select only the requested columns and rows)
             df_filtered = df.loc[start_date:end_date, selected_funds]
-            
-            # 3. NOW we drop rows where THESE SPECIFIC funds are missing data
-            # "how='any'" means if any of the selected funds is missing a price today, skip the day.
             df_filtered = df_filtered.dropna(how='any')
             
             if df_filtered.empty:
-                st.warning("⚠️ No common data found for these funds in this time range. They might have different start dates.")
+                st.warning("⚠️ No data available for selected funds in this period.")
             else:
                 st.success(f"✅ Analyzing {len(selected_funds)} funds | {len(df_filtered)} trading days")
 
@@ -131,23 +139,34 @@ if sheet_url:
                 best_weights = weights_record[best_idx]
                 best_allocation = dict(zip(selected_funds, best_weights))
                 
-                # Show allocation
                 cols = st.columns(len(selected_funds))
                 for i, (f, w) in enumerate(best_allocation.items()):
                     cols[i].metric(f, f"{w*100:.1f}%")
 
-                # --- 2. BACKTEST ---
-                st.subheader("2. Backtest Results")
+                # --- 2. BACKTEST WITH XIRR ---
+                st.subheader("2. Backtest Results (XIRR)")
                 monthly_data = df_filtered.resample('MS').first()
                 total_invested = 0
                 units = {f:0.0 for f in selected_funds}
+                
+                # We need to track cash flows for XIRR
+                # Format: (Date, Amount). Amount is negative for SIP, positive for final value.
+                cash_flows_date = []
+                cash_flows_amount = []
+                
                 ledger = []
                 
                 for date, row in monthly_data.iterrows():
+                    # 1. Record the SIP Investment (Outflow)
                     total_invested += sip_amount
+                    cash_flows_date.append(date)
+                    cash_flows_amount.append(-sip_amount)
+                    
+                    # 2. Buy Units
                     for f in selected_funds:
                         units[f] += (sip_amount * best_allocation[f]) / row[f]
                     
+                    # 3. Track Portfolio Value
                     curr_val = sum([units[f] * row[f] for f in selected_funds])
                     ledger.append({'Date': date, 'Invested': total_invested, 'Value': curr_val})
                 
@@ -158,15 +177,18 @@ if sheet_url:
                     invested = res_df.iloc[-1]['Invested']
                     profit = final_val - invested
                     
-                    # Calculate XIRR/CAGR approx
-                    years_actual = (res_df.iloc[-1]['Date'] - res_df.iloc[0]['Date']).days / 365.25
-                    cagr = ((final_val / invested)**(1/years_actual) - 1) * 100 if years_actual > 0 else 0
+                    # Add final value as a positive cash flow on the last date
+                    cash_flows_date.append(res_df.iloc[-1]['Date'])
+                    cash_flows_amount.append(final_val)
+                    
+                    # Calculate XIRR
+                    xirr_val = calculate_xirr(cash_flows_date, cash_flows_amount) * 100
 
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Total Invested", f"₹{invested:,.0f}")
                     c2.metric("Final Value", f"₹{final_val:,.0f}")
                     c3.metric("Net Profit", f"₹{profit:,.0f}")
-                    c4.metric("CAGR (Approx)", f"{cagr:.1f}%")
+                    c4.metric("XIRR", f"{xirr_val:.2f}%")
                     
                     fig = px.line(res_df, x='Date', y=['Invested', 'Value'], 
                                   color_discrete_map={'Invested':'#D3D3D3', 'Value':'#00CC96'})
