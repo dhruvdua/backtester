@@ -9,7 +9,7 @@ from scipy import optimize
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Pro Strategy Lab", layout="wide")
-st.title("🧪 Multi-Sheet Strategy Lab (Fixed)")
+st.title("🧪 Multi-Sheet Strategy Lab")
 st.markdown("""
 <style>
     .main > div {padding-top: 2rem;}
@@ -84,7 +84,13 @@ def load_data(sheet_url):
                 # Standardize Date
                 df.rename(columns={date_col: 'Date'}, inplace=True)
                 df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
+                
+                # --- FIX FOR "Reindexing only valid with uniquely valued Index objects" ---
+                # 1. Drop rows where Date is missing
                 df = df.dropna(subset=['Date'])
+                # 2. Drop DUPLICATE dates (Keep the first occurrence)
+                df = df.drop_duplicates(subset=['Date'], keep='first')
+                
                 df.set_index('Date', inplace=True)
                 
                 # Clean Numbers (Remove commas, quotes)
@@ -129,173 +135,4 @@ optimize_for = st.sidebar.selectbox(
 )
 
 # --- MAIN APP LOGIC ---
-if sheet_url:
-    with st.spinner("Processing all tabs in Google Sheet..."):
-        df = load_data(sheet_url)
-    
-    if not df.empty:
-        all_funds = df.columns.tolist()
-        st.sidebar.markdown("---")
-        selected_funds = st.sidebar.multiselect("Select Funds (Min 2)", all_funds, default=all_funds[:2])
-        
-        if len(selected_funds) > 1:
-            # --- DATE ALIGNMENT LOGIC ---
-            # 1. Select only the funds the user wants
-            df_selected = df[selected_funds]
-            
-            # 2. Find the "Common Window"
-            valid_data = df_selected.dropna()
-            
-            if valid_data.empty:
-                st.error("❌ No overlapping dates found. These funds never traded on the same days.")
-            else:
-                common_start = valid_data.index.min()
-                common_end = valid_data.index.max()
-                
-                # Calculate max years available in this common window
-                max_available_years = (common_end - common_start).days / 365.25
-                
-                st.sidebar.markdown("---")
-                st.sidebar.info(f"📅 **Common Data Found:**\n{common_start.date()} to {common_end.date()}")
-                
-                # Slider for User Duration
-                if max_available_years < 0.1:
-                     st.error("Less than 1 month of common data available.")
-                else:
-                    years = st.sidebar.slider(
-                        "Analysis Duration", 
-                        min_value=0.1, 
-                        max_value=float(f"{max_available_years:.1f}"), 
-                        value=float(f"{max_available_years:.1f}"),
-                        step=0.1
-                    )
-                    
-                    # --- FIX START: Use days instead of years to handle float values ---
-                    days_offset = int(years * 365.25)
-                    analysis_start = common_end - pd.DateOffset(days=days_offset)
-                    # --- FIX END ---
-                    
-                    if analysis_start < common_start: analysis_start = common_start
-                    
-                    df_filtered = valid_data.loc[analysis_start:common_end]
-                    
-                    st.success(f"✅ Analyzing aligned data: **{analysis_start.date()}** to **{common_end.date()}** ({len(df_filtered)} days)")
-
-                    # --- 2. MONTE CARLO ENGINE ---
-                    st.subheader(f"1. AI Strategy: Maximizing {optimize_for}")
-                    
-                    daily_returns = df_filtered.pct_change().dropna()
-                    mean_returns = daily_returns.mean() * 252 
-                    cov_matrix = daily_returns.cov() * 252
-                    
-                    num_portfolios = 3000
-                    results_list = []
-                    all_weights = []
-                    
-                    progress_bar = st.progress(0)
-                    for i in range(num_portfolios):
-                        weights = np.random.random(len(selected_funds))
-                        weights /= np.sum(weights)
-                        all_weights.append(weights)
-                        
-                        # Return & Vol
-                        port_return = np.sum(mean_returns * weights)
-                        port_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-                        
-                        # Sharpe
-                        sharpe = port_return / port_volatility if port_volatility > 0 else 0
-                        
-                        # RoMaD
-                        port_daily_ret = daily_returns.dot(weights)
-                        cumulative_ret = (1 + port_daily_ret).cumprod()
-                        peak = cumulative_ret.cummax()
-                        drawdown = (cumulative_ret - peak) / peak
-                        max_dd = abs(drawdown.min())
-                        
-                        romad = port_return / max_dd if max_dd > 0 else 0
-                        
-                        results_list.append({
-                            "Return": port_return,
-                            "Sharpe": sharpe,
-                            "RoMaD": romad,
-                            "MaxDD": max_dd
-                        })
-                        
-                        if i % 300 == 0: progress_bar.progress(i/num_portfolios)
-                    
-                    progress_bar.empty()
-                    results_df = pd.DataFrame(results_list)
-                    
-                    # Select Best
-                    if "RoMaD" in optimize_for:
-                        best_idx = results_df['RoMaD'].idxmax()
-                    elif "Sharpe" in optimize_for:
-                        best_idx = results_df['Sharpe'].idxmax()
-                    else: 
-                        best_idx = results_df['Return'].idxmax()
-
-                    best_weights = all_weights[best_idx]
-                    best_stats = results_df.iloc[best_idx]
-                    
-                    # Display Allocation
-                    best_allocation = dict(zip(selected_funds, best_weights))
-                    cols = st.columns(len(selected_funds))
-                    for i, (f, w) in enumerate(best_allocation.items()):
-                        cols[i].metric(f, f"{w*100:.1f}%")
-                    
-                    st.caption(f"Theoretical Stats: RoMaD: {best_stats['RoMaD']:.2f} | Sharpe: {best_stats['Sharpe']:.2f} | Est. Return: {best_stats['Return']*100:.1f}%")
-
-                    # --- 3. SIP BACKTEST ---
-                    st.subheader("2. Backtest Results (Realized)")
-                    
-                    monthly_data = df_filtered.resample('MS').first()
-                    total_invested = 0
-                    units = {f:0.0 for f in selected_funds}
-                    cash_flows_date = []
-                    cash_flows_amount = []
-                    ledger = []
-                    
-                    for date, row in monthly_data.iterrows():
-                        total_invested += sip_amount
-                        cash_flows_date.append(date)
-                        cash_flows_amount.append(-sip_amount)
-                        
-                        for f in selected_funds:
-                            if row[f] > 0:
-                                units[f] += (sip_amount * best_allocation[f]) / row[f]
-                        
-                        curr_val = sum([units[f] * row[f] for f in selected_funds])
-                        ledger.append({'Date': date, 'Invested': total_invested, 'Value': curr_val})
-                    
-                    res_df = pd.DataFrame(ledger)
-                    
-                    if not res_df.empty:
-                        final_val = res_df.iloc[-1]['Value']
-                        invested = res_df.iloc[-1]['Invested']
-                        profit = final_val - invested
-                        
-                        cash_flows_date.append(res_df.iloc[-1]['Date'])
-                        cash_flows_amount.append(final_val)
-                        
-                        xirr_val = calculate_xirr(cash_flows_date, cash_flows_amount) * 100
-                        
-                        res_df['Peak'] = res_df['Value'].cummax()
-                        res_df['Drawdown'] = (res_df['Value'] - res_df['Peak']) / res_df['Peak']
-                        realized_max_dd = res_df['Drawdown'].min() * 100
-                        
-                        realized_romad = xirr_val / abs(realized_max_dd) if realized_max_dd != 0 else 0
-                        
-                        c1, c2, c3, c4, c5 = st.columns(5)
-                        c1.metric("Total Invested", f"₹{invested:,.0f}")
-                        c2.metric("Current Value", f"₹{final_val:,.0f}")
-                        c3.metric("XIRR", f"{xirr_val:.2f}%", delta="Net Profit")
-                        c4.metric("Sharpe", f"{best_stats['Sharpe']:.2f}")
-                        c5.metric("RoMaD", f"{realized_romad:.2f}", help=f"Max DD: {realized_max_dd:.1f}%")
-
-                        fig = px.line(res_df, x='Date', y=['Invested', 'Value'], 
-                                      title=f"Performance ({optimize_for} Strategy)",
-                                      color_discrete_map={'Invested':'#D3D3D3', 'Value':'#00CC96'})
-                        fig.update_traces(fill='tozeroy')
-                        st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("👈 Select at least 2 funds to start optimization.")
+if sheet
