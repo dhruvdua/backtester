@@ -253,7 +253,7 @@ if sheet_url:
                             run_opt = st.button("🚀 Run AI Optimizer")
 
                         if run_opt:
-                            with st.spinner(f"Simulating 3,000 portfolios to maximize {optimize_for}..."):
+                            with st.spinner(f"Simulating 10,000 portfolios to maximize {optimize_for}..."):
                                 # Monte Carlo Logic
                                 daily_returns = df_filtered.pct_change().dropna()
                                 mean_returns = daily_returns.mean() * 252 
