@@ -9,7 +9,7 @@ from scipy import optimize
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Pro Strategy Lab", layout="wide")
-st.title("🧪 Multi-Sheet Strategy Lab")
+st.title("🧪 Multi-Sheet Strategy Lab (Fixed)")
 st.markdown("""
 <style>
     .main > div {padding-top: 2rem;}
@@ -144,8 +144,6 @@ if sheet_url:
             df_selected = df[selected_funds]
             
             # 2. Find the "Common Window"
-            # dropna() removes any row where even ONE fund is missing data.
-            # This leaves us with only the dates where ALL funds existed.
             valid_data = df_selected.dropna()
             
             if valid_data.empty:
@@ -161,18 +159,22 @@ if sheet_url:
                 st.sidebar.info(f"📅 **Common Data Found:**\n{common_start.date()} to {common_end.date()}")
                 
                 # Slider for User Duration
-                if max_available_years < 0.5:
-                    st.error("Less than 6 months of common data available.")
+                if max_available_years < 0.1:
+                     st.error("Less than 1 month of common data available.")
                 else:
                     years = st.sidebar.slider(
                         "Analysis Duration", 
-                        min_value=0.5, 
+                        min_value=0.1, 
                         max_value=float(f"{max_available_years:.1f}"), 
-                        value=float(f"{max_available_years:.1f}")
+                        value=float(f"{max_available_years:.1f}"),
+                        step=0.1
                     )
                     
-                    # 3. Filter Final Data based on Slider
-                    analysis_start = common_end - pd.DateOffset(years=years)
+                    # --- FIX START: Use days instead of years to handle float values ---
+                    days_offset = int(years * 365.25)
+                    analysis_start = common_end - pd.DateOffset(days=days_offset)
+                    # --- FIX END ---
+                    
                     if analysis_start < common_start: analysis_start = common_start
                     
                     df_filtered = valid_data.loc[analysis_start:common_end]
