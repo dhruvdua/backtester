@@ -66,7 +66,7 @@ def load_data(sheet_url):
 
         # Force Date parsing (Coerce errors to NaT)
         # Try parsing with dayfirst=True (handles DD-MM-YYYY which is common in India)
-        df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         
         # Drop rows with invalid dates
         df = df.dropna(subset=['Date'])
