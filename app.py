@@ -259,7 +259,7 @@ if sheet_url:
                                 mean_returns = daily_returns.mean() * 252 
                                 cov_matrix = daily_returns.cov() * 252
                                 
-                                num_portfolios = 3000
+                                num_portfolios = 10000
                                 best_score = -np.inf
                                 best_w_array = []
                                 
