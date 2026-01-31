@@ -51,10 +51,25 @@ def calculate_xirr(dates, amounts):
     except (RuntimeError, OverflowError):
         return 0.0
 
+def calculate_rolling_returns(series, years=3):
+    """
+    Calculates the average annualized rolling return over a specified period.
+    Assumes 'series' is daily cumulative portfolio value.
+    """
+    trading_days = int(years * 252)
+    if len(series) < trading_days:
+        return 0.0
+    
+    # Calculate returns for every window of 'trading_days'
+    # Formula: (Price_End / Price_Start)^(1/years) - 1
+    rolling_ret = (series / series.shift(trading_days)) ** (1/years) - 1
+    return rolling_ret.mean()
+
 def run_backtest(df, weights, sip_amount):
     """
     Core engine to calculate metrics for ANY set of weights
     """
+    # 1. SIP Simulation (Monthly)
     monthly_data = df.resample('MS').first()
     total_invested = 0
     units = {f:0.0 for f in weights.keys()}
@@ -76,10 +91,16 @@ def run_backtest(df, weights, sip_amount):
         ledger.append({'Date': date, 'Invested': total_invested, 'Value': curr_val})
     
     res_df = pd.DataFrame(ledger)
-    
     if res_df.empty: return None, None
     
-    # Calculate Metrics
+    # 2. Daily Portfolio Path (For Rolling Returns & Sharpe)
+    # We need daily path to calculate rolling returns accurately
+    daily_ret = df.pct_change().dropna()
+    w_array = np.array([weights[col] for col in df.columns]) / 100.0
+    daily_port_ret = daily_ret.dot(w_array)
+    daily_cum_path = (1 + daily_port_ret).cumprod()
+    
+    # Metrics Calculation
     final_val = res_df.iloc[-1]['Value']
     invested = res_df.iloc[-1]['Invested']
     
@@ -94,11 +115,11 @@ def run_backtest(df, weights, sip_amount):
     max_dd = abs(res_df['Drawdown'].min()) * 100
     romad = xirr_val / max_dd if max_dd > 0 else 0
     
-    # Sharpe (Estimate)
-    daily_ret = df.pct_change().dropna()
-    w_array = np.array([weights[col] for col in df.columns]) / 100.0
-    port_daily = daily_ret.dot(w_array)
-    sharpe = (port_daily.mean() * 252) / (port_daily.std() * np.sqrt(252))
+    # Sharpe
+    sharpe = (daily_port_ret.mean() * 252) / (daily_port_ret.std() * np.sqrt(252))
+    
+    # 3-Year Average Rolling Return
+    avg_rolling_3y = calculate_rolling_returns(daily_cum_path, years=3) * 100
 
     metrics = {
         "Invested": invested,
@@ -106,7 +127,8 @@ def run_backtest(df, weights, sip_amount):
         "XIRR": xirr_val,
         "RoMaD": romad,
         "MaxDD": max_dd,
-        "Sharpe": sharpe
+        "Sharpe": sharpe,
+        "Rolling3Y": avg_rolling_3y
     }
     
     return metrics, res_df
@@ -166,8 +188,7 @@ num_simulations = st.sidebar.number_input(
     min_value=500, 
     max_value=50000, 
     value=3000, 
-    step=500,
-    help="Higher number = Better accuracy but slower speed."
+    step=500
 )
 
 # --- MAIN APP ---
@@ -176,7 +197,6 @@ if sheet_url:
         df = load_data(sheet_url)
     
     if not df.empty:
-        # Fund Selection
         all_funds = df.columns.tolist()
         st.subheader("1. Select Funds & Time Period")
         c1, c2 = st.columns([1, 1])
@@ -184,7 +204,6 @@ if sheet_url:
             selected_funds = st.multiselect("Select Funds (Min 2)", all_funds, default=all_funds[:2])
         
         if len(selected_funds) > 1:
-            # Date Alignment
             df_selected = df[selected_funds]
             valid_data = df_selected.dropna()
             
@@ -205,13 +224,11 @@ if sheet_url:
                         if analysis_start < common_start: analysis_start = common_start
                         df_filtered = valid_data.loc[analysis_start:common_end]
 
-                        # --- MANUAL ALLOCATION SECTION ---
+                        # --- MANUAL ALLOCATION ---
                         st.markdown("---")
                         st.subheader("2. Define Your Strategy")
-                        
                         col_manual, col_chart = st.columns([1, 2])
                         
-                        # A. Manual Inputs
                         manual_weights = {}
                         with col_manual:
                             st.write("#### 🎛️ Manual Allocation")
@@ -221,45 +238,39 @@ if sheet_url:
                                 w = st.number_input(f"{fund} (%)", min_value=0, max_value=100, value=default_w, step=5)
                                 manual_weights[fund] = w
                                 total_w += w
-                            
-                            if total_w != 100:
-                                st.warning(f"⚠️ Total allocation is {total_w}%. Ideally should be 100%.")
-                            else:
-                                st.success("✅ Allocation totals 100%")
+                            if total_w != 100: st.warning(f"Total: {total_w}%")
 
-                        # B. Calculate Manual Metrics
                         m_metrics, m_df = run_backtest(df_filtered, manual_weights, sip_amount)
 
-                        # C. Display Manual Stats
                         with col_chart:
-                            st.write("#### 📊 Your Strategy Performance")
+                            st.write("#### 📊 Your Performance")
                             if m_metrics:
-                                mc1, mc2, mc3 = st.columns(3)
+                                mc1, mc2, mc3, mc4 = st.columns(4)
                                 mc1.metric("XIRR", f"{m_metrics['XIRR']:.2f}%", help="Annualized SIP Return")
-                                mc2.metric("RoMaD", f"{m_metrics['RoMaD']:.2f}", help=f"Max DD: {m_metrics['MaxDD']:.1f}%")
-                                mc3.metric("Sharpe", f"{m_metrics['Sharpe']:.2f}", help="Return/Risk Ratio")
+                                mc2.metric("3Y Rolling", f"{m_metrics['Rolling3Y']:.2f}%", help="Avg 3-Year Rolling Return (Consistency)")
+                                mc3.metric("RoMaD", f"{m_metrics['RoMaD']:.2f}", help=f"Max DD: {m_metrics['MaxDD']:.1f}%")
+                                mc4.metric("Sharpe", f"{m_metrics['Sharpe']:.2f}")
                                 
                                 fig = px.line(m_df, x='Date', y=['Invested', 'Value'], 
                                               color_discrete_map={'Invested':'#D3D3D3', 'Value':'#3b82f6'})
                                 fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
                                 st.plotly_chart(fig, use_container_width=True)
 
-                        # --- AI OPTIMIZATION SECTION ---
+                        # --- AI OPTIMIZATION ---
                         st.markdown("---")
-                        st.subheader("3. Can AI Beat Your Strategy?")
+                        st.subheader("3. AI Optimization Engine")
                         
                         opt_col1, opt_col2 = st.columns([1, 3])
                         
                         with opt_col1:
                             optimize_for = st.selectbox(
-                                "Optimization Goal:",
-                                ("RoMaD (Max Safety)", "Sharpe (Max Efficiency)", "Returns (Max Profit)")
+                                "Maximize For:",
+                                ("Rolling Returns (Consistency)", "RoMaD (Max Safety)", "Sharpe (Max Efficiency)", "Returns (Max Profit)")
                             )
                             run_opt = st.button("🚀 Run AI Optimizer")
 
                         if run_opt:
-                            with st.spinner(f"Running {num_simulations} simulations to maximize {optimize_for}..."):
-                                # Monte Carlo Logic
+                            with st.spinner(f"Simulating {num_simulations} portfolios..."):
                                 daily_returns = df_filtered.pct_change().dropna()
                                 mean_returns = daily_returns.mean() * 252 
                                 cov_matrix = daily_returns.cov() * 252
@@ -267,25 +278,40 @@ if sheet_url:
                                 best_score = -np.inf
                                 best_w_array = []
                                 
-                                # Use the user-input simulation count
+                                # Rolling Return window (3 years = ~756 days)
+                                roll_window = 756
+                                
                                 for i in range(num_simulations):
                                     w = np.random.random(len(selected_funds))
                                     w /= np.sum(w)
                                     
-                                    # Calc Metrics
+                                    # Basic Metrics
                                     ret = np.sum(mean_returns * w)
                                     vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
                                     sharpe = ret / vol if vol > 0 else 0
                                     
-                                    # RoMaD Path Calc
-                                    path = (1 + daily_returns.dot(w)).cumprod()
-                                    dd = (path - path.cummax()) / path.cummax()
+                                    # Path Calculation (Vectorized)
+                                    path_daily = daily_returns.dot(w)
+                                    cum_path = (1 + path_daily).cumprod()
+                                    
+                                    # RoMaD
+                                    dd = (cum_path - cum_path.cummax()) / cum_path.cummax()
                                     max_dd = abs(dd.min())
                                     romad = ret / max_dd if max_dd > 0 else 0
+                                    
+                                    # Rolling Returns
+                                    # Use NumPy slicing for speed: values[756:] / values[:-756]
+                                    if len(cum_path) > roll_window:
+                                        # Calculate 3Y returns across the whole history
+                                        roll_ret_series = (cum_path.values[roll_window:] / cum_path.values[:-roll_window]) ** (1/3) - 1
+                                        avg_roll = np.mean(roll_ret_series)
+                                    else:
+                                        avg_roll = 0
                                     
                                     # Score based on Goal
                                     if "RoMaD" in optimize_for: score = romad
                                     elif "Sharpe" in optimize_for: score = sharpe
+                                    elif "Rolling" in optimize_for: score = avg_roll
                                     else: score = ret
                                     
                                     if score > best_score:
@@ -293,7 +319,6 @@ if sheet_url:
                                         best_w_array = w
                                 
                                 best_weights = {f: w*100 for f, w in zip(selected_funds, best_w_array)}
-                                
                                 ai_metrics, ai_df = run_backtest(df_filtered, best_weights, sip_amount)
                                 
                                 st.success(f"✅ Optimization Complete! Best {optimize_for} Strategy found.")
@@ -309,16 +334,18 @@ if sheet_url:
                                     st.dataframe(ai_alloc_df.style.format("{:.1f}%"))
                                 
                                 comp_metrics = pd.DataFrame({
-                                    "Metric": ["XIRR", "RoMaD", "Max Drawdown", "Sharpe", "Final Value"],
+                                    "Metric": ["XIRR", "Avg 3Y Rolling", "RoMaD", "Max Drawdown", "Sharpe", "Final Value"],
                                     "Your Strategy": [
-                                        f"{m_metrics['XIRR']:.2f}%", 
+                                        f"{m_metrics['XIRR']:.2f}%",
+                                        f"{m_metrics['Rolling3Y']:.2f}%", 
                                         f"{m_metrics['RoMaD']:.2f}", 
                                         f"{m_metrics['MaxDD']:.2f}%", 
                                         f"{m_metrics['Sharpe']:.2f}",
                                         f"₹{m_metrics['Current Value']:,.0f}"
                                     ],
                                     "AI Strategy": [
-                                        f"{ai_metrics['XIRR']:.2f}%", 
+                                        f"{ai_metrics['XIRR']:.2f}%",
+                                        f"{ai_metrics['Rolling3Y']:.2f}%",
                                         f"{ai_metrics['RoMaD']:.2f}", 
                                         f"{ai_metrics['MaxDD']:.2f}%", 
                                         f"{ai_metrics['Sharpe']:.2f}",
@@ -335,6 +362,5 @@ if sheet_url:
                                 fig_comp = px.line(merged_chart, x='Date', y=['Invested', 'Your Strategy', 'AI Strategy'],
                                                    color_discrete_map={'Invested':'#D3D3D3', 'Your Strategy':'#3b82f6', 'AI Strategy':'#22c55e'})
                                 st.plotly_chart(fig_comp, use_container_width=True)
-
         else:
             st.info("👈 Select at least 2 funds from the sidebar to begin.")
