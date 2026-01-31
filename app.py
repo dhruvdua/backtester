@@ -2,111 +2,168 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 
-# Page Config
-st.set_page_config(page_title="SIP Backtester", layout="wide")
+# --- Page Configuration ---
+st.set_page_config(page_title="SIP Backtest Pro", layout="wide")
 st.title("💰 Mutual Fund SIP Backtester & Optimizer")
 
+# --- Helper Function: Convert Google Sheet URL to CSV ---
+def get_csv_url(url):
+    """
+    Converts a standard Google Sheet 'edit' URL into a downloadable CSV URL.
+    Handles specific sheet IDs (gid) if present.
+    """
+    if "docs.google.com/spreadsheets" not in url:
+        return url  # Return as is if it's not a google sheet (maybe it's a direct csv link)
+    
+    # 1. Base URL cleanup
+    base_url = url.split('/edit')[0]
+    
+    # 2. Check for 'gid' (Sheet ID) to grab the specific tab
+    # The gid is usually in the params or hash like #gid=12345
+    gid = "0" # Default to first sheet
+    if "gid=" in url:
+        # Extract gid from URL parameters
+        import re
+        gid_match = re.search(r'gid=(\d+)', url)
+        if gid_match:
+            gid = gid_match.group(1)
+            
+    # 3. Construct the export URL
+    final_url = f"{base_url}/export?format=csv&gid={gid}"
+    return final_url
+
+# --- 1. Data Loading ---
 @st.cache_data
 def load_data(sheet_url):
-    # Read CSV from the published Google Sheet URL
-    df = pd.read_csv(sheet_url)
-    df['Date'] = pd.to_datetime(df['Date'])
-    df.set_index('Date', inplace=True)
-    return df
+    try:
+        csv_url = get_csv_url(sheet_url)
+        df = pd.read_csv(csv_url)
+        
+        # specific cleanup for your date column
+        # Ensure your date column is named 'Date' in the sheet
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Error loading data: {e}. Check if the sheet is 'Published to Web' or 'Anyone with link can view'.")
+        return pd.DataFrame()
 
-# Sidebar Inputs
-sheet_url = st.sidebar.text_input("Paste Google Sheet CSV URL")
-sip_amount = st.sidebar.number_input("Monthly SIP Amount (₹)", value=10000)
-years = st.sidebar.number_input("Duration (Years)", value=5)
+# --- 2. Sidebar Inputs ---
+st.sidebar.header("Configuration")
+default_url = "https://docs.google.com/spreadsheets/d/1lMNqoG0Z_WehJVUlP4-3Jf6cDofjUOu5FMK-xJ1EnOU/edit?gid=0#gid=0"
+sheet_url = st.sidebar.text_input("Paste Google Sheet URL", value=default_url)
+sip_amount = st.sidebar.number_input("Monthly SIP Amount (₹)", value=10000, step=1000)
+years = st.sidebar.slider("Investment Duration (Years)", min_value=1, max_value=10, value=3)
 
+# --- Main Logic ---
 if sheet_url:
-    data = load_data(sheet_url)
-    fund_list = data.columns.tolist()
-    selected_funds = st.sidebar.multiselect("Select Funds", fund_list, default=fund_list[:2])
+    df = load_data(sheet_url)
     
-    # Filter data for the selected duration (Backdate from today)
-    start_date = data.index.max() - pd.DateOffset(years=years)
-    df_filtered = data.loc[start_date:data.index.max(), selected_funds]
-
-def optimize_portfolio(prices_df):
-    # Calculate daily returns
-    returns = prices_df.pct_change()
-    mean_returns = returns.mean() * 252 # Annualized
-    cov_matrix = returns.cov() * 252
-
-    num_portfolios = 5000 # Monte Carlo iterations
-    results = np.zeros((3, num_portfolios))
-    weights_record = []
-
-    for i in range(num_portfolios):
-        # Generate random weights
-        weights = np.random.random(len(prices_df.columns))
-        weights /= np.sum(weights) # Normalize to equal 1 (100%)
-        weights_record.append(weights)
-
-        # Calculate Portfolio Return & Volatility
-        p_return = np.sum(mean_returns * weights)
-        p_std_dev = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+    if not df.empty:
+        # Fund Selection
+        all_funds = df.columns.tolist()
+        selected_funds = st.sidebar.multiselect("Select Funds to Analyze", all_funds, default=all_funds[:2])
         
-        # Store results (Return, Risk, Sharpe Ratio)
-        results[0,i] = p_return
-        results[1,i] = p_std_dev
-        results[2,i] = p_return / p_std_dev # Sharpe Ratio
+        if selected_funds:
+            # Filter Data by Time (Backdate from today)
+            end_date = df.index.max()
+            start_date = end_date - pd.DateOffset(years=years)
+            
+            # Slice the dataframe to the relevant window and funds
+            # We use 'loc' to slice by date index
+            df_filtered = df.loc[start_date:end_date, selected_funds].dropna()
+            
+            st.write(f"Analyzing data from **{start_date.date()}** to **{end_date.date()}**")
 
-    # Find the portfolio with Max Sharpe Ratio
-    max_sharpe_idx = np.argmax(results[2])
-    optimal_weights = weights_record[max_sharpe_idx]
-    
-    return optimal_weights, results
+            # --- 3. Monte Carlo Optimization ---
+            st.subheader("1. AI Optimized Strategy")
+            
+            # Calculate Daily Returns
+            returns = df_filtered.pct_change()
+            mean_returns = returns.mean() * 252
+            cov_matrix = returns.cov() * 252
+            
+            # Simulation
+            num_portfolios = 2000
+            results_arr = np.zeros((3, num_portfolios))
+            all_weights = []
+            
+            for i in range(num_portfolios):
+                weights = np.random.random(len(selected_funds))
+                weights /= np.sum(weights)
+                all_weights.append(weights)
+                
+                p_ret = np.sum(mean_returns * weights)
+                p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+                
+                results_arr[0,i] = p_ret
+                results_arr[1,i] = p_vol
+                results_arr[2,i] = p_ret / p_vol # Sharpe Ratio
 
-if sheet_url and selected_funds:
-    st.subheader("🤖 Calculating Optimal Allocation...")
-    opt_weights, sim_results = optimize_portfolio(df_filtered)
-    
-    # Display Optimal Weights
-    best_allocation = dict(zip(selected_funds, opt_weights))
-    st.write("Based on Monte Carlo simulations, the ideal allocation to maximize risk-adjusted returns is:")
-    st.json({k: f"{v*100:.2f}%" for k, v in best_allocation.items()})
+            # Get Best Portfolio
+            max_sharpe_idx = np.argmax(results_arr[2])
+            best_weights = all_weights[max_sharpe_idx]
+            best_allocation = dict(zip(selected_funds, best_weights))
 
-def calculate_sip(df, allocations, monthly_amt):
-    # Resample data to Monthly (taking the first price of the month)
-    monthly_data = df.resample('MS').first()
-    
-    total_invested = 0
-    portfolio_units = {fund: 0 for fund in allocations.keys()}
-    portfolio_value_over_time = []
+            # Display Optimal Allocation
+            cols = st.columns(len(selected_funds))
+            for idx, (fund, weight) in enumerate(best_allocation.items()):
+                cols[idx].metric(label=fund, value=f"{weight*100:.1f}%")
 
-    for date, row in monthly_data.iterrows():
-        total_invested += monthly_amt
-        
-        # Buy units for each fund based on allocation
-        for fund, weight in allocations.items():
-            fund_amt = monthly_amt * weight
-            units_bought = fund_amt / row[fund]
-            portfolio_units[fund] += units_bought
-        
-        # Calculate current value of portfolio
-        current_val = 0
-        for fund in allocations.keys():
-            current_val += portfolio_units[fund] * row[fund]
-        
-        portfolio_value_over_time.append({'Date': date, 'Portfolio Value': current_val, 'Invested': total_invested})
+            # --- 4. SIP Backtest Implementation ---
+            st.subheader("2. SIP Performance Check")
+            
+            # Resample to Monthly for SIP (Buying on 1st of month)
+            monthly_data = df_filtered.resample('MS').first()
+            
+            # Initialize tracking
+            total_invested = 0
+            # Current value starts at 0
+            ledger = []
 
-    return pd.DataFrame(portfolio_value_over_time)
+            # We need to track units accumulated per fund
+            units_held = {fund: 0.0 for fund in selected_funds}
 
-if sheet_url and selected_funds:
-    # Run SIP calculation using the Optimal Weights found above
-    backtest_df = calculate_sip(df_filtered, best_allocation, sip_amount)
-    
-    final_value = backtest_df.iloc[-1]['Portfolio Value']
-    total_investment = backtest_df.iloc[-1]['Invested']
-    
-    st.metric("Total Invested", f"₹{total_investment:,.2f}")
-    st.metric("Current Value", f"₹{final_value:,.2f}", delta=f"{(final_value-total_investment)/total_investment*100:.1f}% Return")
-    
-    # Chart
-    fig = px.line(backtest_df, x='Date', y=['Portfolio Value', 'Invested'], title="SIP Performance Curve")
-    st.plotly_chart(fig)
+            for date, row in monthly_data.iterrows():
+                total_invested += sip_amount
+                
+                # Buy units
+                for fund in selected_funds:
+                    allocation_amt = sip_amount * best_allocation[fund]
+                    price = row[fund]
+                    if price > 0: # Avoid division by zero
+                        units = allocation_amt / price
+                        units_held[fund] += units
+                
+                # Calculate Portfolio Value on this date
+                current_value = sum([units_held[f] * row[f] for f in selected_funds])
+                
+                ledger.append({
+                    'Date': date,
+                    'Invested': total_invested,
+                    'Portfolio Value': current_value
+                })
+            
+            # Create DataFrame for results
+            res_df = pd.DataFrame(ledger)
+            
+            if not res_df.empty:
+                final_val = res_df.iloc[-1]['Portfolio Value']
+                final_inv = res_df.iloc[-1]['Invested']
+                abs_return = final_val - final_inv
+                xirr_approx = ((final_val / final_inv)**(1/years) - 1) * 100
 
+                # Metrics
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Invested", f"₹{final_inv:,.0f}")
+                m2.metric("Final Value", f"₹{final_val:,.0f}")
+                m3.metric("Net Profit", f"₹{abs_return:,.0f}", delta=f"{xirr_approx:.2f}% CAGR (Approx)")
+
+                # Visuals
+                fig = px.line(res_df, x='Date', y=['Invested', 'Portfolio Value'], 
+                              color_discrete_map={"Invested": "gray", "Portfolio Value": "#00CC96"})
+                st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.warning("Please select at least one fund from the sidebar.")
