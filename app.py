@@ -96,16 +96,13 @@ def run_backtest(df, weights, sip_amount):
     max_dd = abs(res_df['Drawdown'].min()) * 100
     romad = xirr_val / max_dd if max_dd > 0 else 0
     
-    # Standard Deviation (Volatility)
+    # Portfolio Volatility
     port_vol = daily_port_ret.std() * np.sqrt(252)
     sharpe = (daily_port_ret.mean() * 252) / port_vol if port_vol > 0 else 0
     
-    # Diversification Ratio Calculation
-    # 1. Get volatility of each individual fund
+    # Diversification Ratio
     individual_vols = daily_ret.std() * np.sqrt(252)
-    # 2. Weighted average volatility (The "Sum of Parts")
     weighted_vol = np.sum(w_array * individual_vols)
-    # 3. Ratio: Weighted Vol / Actual Portfolio Vol
     div_ratio = weighted_vol / port_vol if port_vol > 0 else 0
     
     avg_rolling_3y = calculate_rolling_returns(daily_cum_path, years=3) * 100
@@ -220,7 +217,6 @@ elif data_source == "AMFI API (Live)":
                     if not df_fund.empty:
                         dfs.append(df_fund)
                 progress_text.empty()
-                
                 if dfs:
                     merged_df = pd.concat(dfs, axis=1)
                     merged_df.sort_index(inplace=True)
@@ -245,7 +241,7 @@ with st.sidebar.expander("🔎 Advanced Filters", expanded=False):
     filter_return = st.slider("Annual Return %", 0.0, 100.0, (0.0, 100.0), step=1.0)
     filter_rolling = st.slider("Avg 3Y Rolling %", 0.0, 100.0, (0.0, 100.0), step=1.0)
     filter_sharpe = st.slider("Sharpe Ratio", 0.0, 5.0, (0.0, 5.0), step=0.1)
-    filter_div = st.slider("Diversification Score", 1.0, 3.0, (1.0, 3.0), step=0.1, help="Higher = More Diversified")
+    filter_div = st.slider("Diversification Score", 1.0, 3.0, (1.0, 3.0), step=0.1)
 
 # --- MAIN APP LOGIC ---
 if not df_global.empty:
@@ -264,7 +260,7 @@ if not df_global.empty:
         valid_data = df_selected.dropna()
         
         if valid_data.empty:
-            st.error("❌ No overlapping dates found. Please check if funds existed during the same period.")
+            st.error("❌ No overlapping dates found.")
         else:
             min_date = valid_data.index.min().date()
             max_date = valid_data.index.max().date()
@@ -283,7 +279,7 @@ if not df_global.empty:
                     st.success(f"Analyzing {len(df_filtered)} trading days.")
 
             if not df_filtered.empty:
-                tab1, tab2 = st.tabs(["🚀 Strategy Lab", "🧩 Correlation Matrix"])
+                tab1, tab2, tab3 = st.tabs(["🚀 Strategy Lab", "🧩 Correlation Matrix", "⚖️ Fund Comparison"])
 
                 # ==========================
                 # TAB 1: STRATEGY LAB
@@ -312,23 +308,20 @@ if not df_global.empty:
                             mc1.metric("XIRR", f"{m_metrics['XIRR']:.2f}%")
                             mc2.metric("3Y Rolling", f"{m_metrics['Rolling3Y']:.2f}%")
                             mc3.metric("RoMaD", f"{m_metrics['RoMaD']:.2f}")
-                            mc4.metric("Div. Score", f"{m_metrics['DivRatio']:.2f}", help="Diversification Ratio (Higher is better)")
+                            mc4.metric("Div. Score", f"{m_metrics['DivRatio']:.2f}")
                             fig = px.line(m_df, x='Date', y=['Invested', 'Value'], 
                                             color_discrete_map={'Invested':'#D3D3D3', 'Value':'#3b82f6'})
                             fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
                             st.plotly_chart(fig, use_container_width=True)
 
-                    # --- AI OPTIMIZATION ---
                     st.markdown("---")
                     st.subheader("3. AI Optimization Engine")
-                    
                     opt_col1, opt_col2 = st.columns([1, 3])
                     with opt_col1:
                         optimize_for = st.selectbox(
                             "Maximize For:",
                             ("Diversification (Min Correlation)", "Rolling Returns (Consistency)", "RoMaD (Max Safety)", "Sharpe (Max Efficiency)", "Returns (Max Profit)")
                         )
-                        st.write("##### 🛠️ Best X Funds Strategy")
                         use_best_x = st.checkbox("Pick Subset?", value=False)
                         if use_best_x:
                             x_funds = st.slider("Number of funds (X)", 2, len(selected_funds), 2)
@@ -341,7 +334,6 @@ if not df_global.empty:
                             daily_returns = df_filtered.pct_change().dropna()
                             mean_returns = daily_returns.mean() * 252 
                             cov_matrix = daily_returns.cov() * 252
-                            # Individual Volatility for Diversification Ratio
                             individual_vols = daily_returns.std() * np.sqrt(252)
                             
                             sim_data = []
@@ -359,8 +351,6 @@ if not df_global.empty:
                                 ret = np.sum(mean_returns * w)
                                 port_vol = np.sqrt(np.dot(w.T, np.dot(cov_matrix, w)))
                                 sharpe = ret / port_vol if port_vol > 0 else 0
-                                
-                                # Diversification Ratio
                                 weighted_vol = np.sum(w * individual_vols)
                                 div_ratio = weighted_vol / port_vol if port_vol > 0 else 0
                                 
@@ -369,6 +359,7 @@ if not df_global.empty:
                                 dd = (cum_path - cum_path.cummax()) / cum_path.cummax()
                                 max_dd = abs(dd.min())
                                 romad = ret / max_dd if max_dd > 0 else 0
+                                
                                 avg_roll = 0
                                 if len(cum_path) > roll_window:
                                     roll_ret_series = (cum_path.values[roll_window:] / cum_path.values[:-roll_window]) ** (1/3) - 1
@@ -444,31 +435,97 @@ if not df_global.empty:
                 with tab2:
                     st.subheader("🧩 Fund Correlation Matrix")
                     st.caption("Lower numbers (Blue) = Better Diversification. Red = Duplication.")
-                    
                     daily_ret = df_filtered.pct_change().dropna()
                     corr_matrix = daily_ret.corr()
-                    
-                    fig_corr = px.imshow(
-                        corr_matrix, 
-                        text_auto=True, 
-                        aspect="auto",
-                        color_continuous_scale="RdBu_r", # Red = High Corr, Blue = Low Corr
-                        zmin=-1, zmax=1
-                    )
+                    fig_corr = px.imshow(corr_matrix, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
                     st.plotly_chart(fig_corr, use_container_width=True)
                     
                     st.subheader("🔄 Rolling Correlation (Dynamic)")
                     f1 = st.selectbox("Fund A", selected_funds, index=0)
                     f2 = st.selectbox("Fund B", selected_funds, index=1 if len(selected_funds)>1 else 0)
-                    
                     if f1 != f2:
-                        roll_corr = daily_ret[f1].rolling(126).corr(daily_ret[f2]) # 6-month rolling
+                        roll_corr = daily_ret[f1].rolling(126).corr(daily_ret[f2]) 
                         fig_roll = px.line(roll_corr, title=f"6-Month Rolling Correlation: {f1} vs {f2}")
                         fig_roll.add_hline(y=0, line_dash="dash", line_color="green", annotation_text="Uncorrelated")
                         fig_roll.update_yaxes(range=[-1, 1])
                         st.plotly_chart(fig_roll, use_container_width=True)
                     else:
                         st.info("Select two different funds to see their dynamic relationship.")
+
+                # ==========================
+                # TAB 3: FUND COMPARISON
+                # ==========================
+                with tab3:
+                    st.subheader("⚖️ Head-to-Head Fund Comparison")
+                    st.caption("Analyzing funds individually to spot winners and losers.")
+
+                    comp_data = []
+                    daily_ret_comp = df_filtered.pct_change().dropna()
+                    # Calculate Correlation of each fund to the 'Average of Others'
+                    corr_matrix = daily_ret_comp.corr()
+                    
+                    for fund in selected_funds:
+                        # 1. SIP XIRR
+                        single_fund_metrics, _ = run_backtest(df_filtered[[fund]], {fund: 100}, sip_amount)
+                        sip_xirr = single_fund_metrics['XIRR'] if single_fund_metrics else 0
+                        
+                        # 2. Lump Sum CAGR & Absolute
+                        start_price = df_filtered[fund].iloc[0]
+                        end_price = df_filtered[fund].iloc[-1]
+                        abs_ret = ((end_price - start_price) / start_price) * 100
+                        days = (df_filtered.index[-1] - df_filtered.index[0]).days
+                        cagr = ((end_price / start_price) ** (365.25/days) - 1) * 100 if days > 0 else 0
+                        
+                        # 3. Risk Metrics
+                        fund_daily = daily_ret_comp[fund]
+                        volatility = fund_daily.std() * np.sqrt(252) * 100
+                        
+                        # Diversifier Score (1 - Avg Correlation to others)
+                        other_funds = [f for f in selected_funds if f != fund]
+                        if other_funds:
+                            avg_corr = corr_matrix[fund][other_funds].mean()
+                            div_score = (1 - avg_corr) * 10  # Scale 0-10
+                        else:
+                            div_score = 0
+                            
+                        # Max Drawdown
+                        cum_ret = (1 + fund_daily).cumprod()
+                        dd = (cum_ret - cum_ret.cummax()) / cum_ret.cummax()
+                        max_dd_val = abs(dd.min()) * 100
+
+                        comp_data.append({
+                            "Fund Name": fund,
+                            "SIP XIRR": f"{sip_xirr:.2f}%",
+                            "Lump Sum CAGR": f"{cagr:.2f}%",
+                            "Volatility (Risk)": f"{volatility:.2f}%",
+                            "Max Drawdown": f"{max_dd_val:.2f}%",
+                            "Diversifier Score (0-10)": f"{div_score:.1f}"
+                        })
+
+                    st.dataframe(pd.DataFrame(comp_data).set_index("Fund Name"), use_container_width=True)
+                    st.info("💡 **Diversifier Score:** Higher is better. It means this fund behaves differently from the rest of your selection.")
+
+                    col_g, col_dd = st.columns(2)
+                    
+                    with col_g:
+                        st.subheader("📈 Normalized Growth (Base 100)")
+                        # Rebase all funds to start at 100
+                        normalized_df = df_filtered / df_filtered.iloc[0] * 100
+                        fig_norm = px.line(normalized_df, title="Hypothetical ₹100 invested in each fund")
+                        st.plotly_chart(fig_norm, use_container_width=True)
+
+                    with col_dd:
+                        st.subheader("📉 Drawdown Comparison")
+                        # Calculate Drawdown for all funds
+                        dd_df = pd.DataFrame()
+                        for fund in selected_funds:
+                            cum = (1 + daily_ret_comp[fund]).cumprod()
+                            dd_df[fund] = (cum - cum.cummax()) / cum.cummax()
+                        
+                        fig_dd_all = px.area(dd_df, title="Crash Depth over Time")
+                        fig_dd_all.update_yaxes(tickformat=".1%")
+                        st.plotly_chart(fig_dd_all, use_container_width=True)
+
     else:
         st.info("👈 Select at least 2 funds.")
 else:
